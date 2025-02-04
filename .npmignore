@@ -1,0 +1,32 @@
+# Source control
+.git
+.gitignore
+
+# Dependencies
+node_modules/
+
+# Tests
+test/
+coverage/
+babel.config.js
+jest.config.js
+
+# Development configs
+.eslintrc
+.prettierrc
+.editorconfig
+.travis.yml
+.github/
+
+# Documentation
+docs/
+examples/
+CONTRIBUTING.md
+
+# Misc
+*.log
+.DS_Store
+.env* 
+
+# Build
+/dist/
