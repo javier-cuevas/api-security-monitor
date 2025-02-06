@@ -1,4 +1,4 @@
-# api-security-monitor
+# API Security Monitor
 
 ![npm version](https://img.shields.io/npm/v/api-security-monitor)
 ![License](https://img.shields.io/npm/l/api-security-monitor)
@@ -49,6 +49,11 @@ app.use(APIMonitor.blockIPs(basicConfig));
 // Then apply the monitoring middleware
 app.use(middleware);
 
+// Example routes
+app.get('/', (req, res) => {
+  res.json({ message: 'API working correctly' });
+});
+
 // Listen for attack events
 monitor.on('attack-detected', (data) => {
   console.log('🚨 Attack detected:', {
@@ -62,6 +67,11 @@ monitor.on('attack-detected', (data) => {
 ## Advanced Usage
 
 ```javascript
+const express = require('express');
+const APIMonitor = require('api-security-monitor');
+
+const app = express();
+
 // Advanced configuration
 const monitorConfig = {
   mongoURI: process.env.MONGO_URI,
@@ -73,9 +83,19 @@ const monitorConfig = {
 
 const { middleware, monitor } = APIMonitor(monitorConfig);
 
-// Apply middlewares
+// Create monitor instance
+const { middleware, monitor } = APIMonitor(monitorConfig);
+
+// First apply the IP blocking middleware
 app.use(APIMonitor.blockIPs(monitorConfig));
+
+// Then apply the monitoring middleware
 app.use(middleware);
+
+// Example routes
+app.get('/', (req, res) => {
+  res.json({ message: 'API working correctly' });
+});
 
 // Query logs with filters
 app.get('/logs', async (req, res) => {

@@ -22,6 +22,11 @@ app.use(APIMonitor.blockIPs(monitorConfig));
 // Then apply the monitoring middleware
 app.use(middleware);
 
+// Example routes
+app.get('/', (req, res) => {
+  res.json({ message: 'API working correctly' });
+});
+
 // Advanced log queries
 app.get('/logs/stats', async (req, res) => {
   try {
@@ -101,10 +106,6 @@ monitor.on('attack-detected', (data) => {
 app.use((err, req, res, next) => {
   console.error('Error:', err);
   res.status(500).json({ error: 'Internal server error' });
-});
-
-app.get('/', (req, res) => {
-  res.json({ message: 'API working correctly' });
 });
 
 const PORT = process.env.PORT || 3000;
