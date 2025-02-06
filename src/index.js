@@ -30,11 +30,12 @@ class APIMonitor extends EventEmitter {
    */
   constructor(options = {}) {
     super();
-    this.mongoURI = options.mongoURI || process.env.MONGO_URI;
-    this.redisURL = options.redisURL || process.env.REDIS_URL;
+    this.saveRecords = options.saveRecords || false;
     this.maxRequests = options.maxRequests || 10;
     this.timeWindow = options.timeWindow || 60;
     this.scanThreshold = options.scanThreshold || 5;
+    this.mongoURI = options.mongoURI || process.env.MONGO_URI;
+    this.redisURL = options.redisURL || process.env.REDIS_URL;
 
     this.connectToMongo();
     this.connectToRedis();

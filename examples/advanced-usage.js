@@ -6,11 +6,12 @@ const app = express();
 
 // Advanced configuration
 const monitorConfig = {
-  mongoURI: process.env.MONGO_URI,
-  redisURL: process.env.REDIS_URL,
+  saveRecords: true, // Save records
   maxRequests: 1000,    // Allow 1000 requests
   timeWindow: 3600,     // Per hour
-  scanThreshold: 20     // Maximum 20 unique endpoints
+  scanThreshold: 20,     // Maximum 20 unique endpoints
+  mongoURI: process.env.MONGO_URI, // MongoDB URI
+  redisURL: process.env.REDIS_URL, // Redis URI
 };
 
 // Create monitor instance

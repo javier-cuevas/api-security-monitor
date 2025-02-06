@@ -6,8 +6,9 @@ const app = express();
 
 // Basic configuration
 const basicConfig = {
-    mongoURI: process.env.MONGO_URI,
-    redisURL: process.env.REDIS_URL
+  saveRecords: false, // Save records
+  mongoURI: process.env.MONGO_URI, // MongoDB URI
+  redisURL: process.env.REDIS_URL // Redis URI
 };
 
 // Create monitor instance
