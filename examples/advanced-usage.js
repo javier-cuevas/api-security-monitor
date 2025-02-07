@@ -6,10 +6,10 @@ const app = express();
 
 // Advanced configuration
 const monitorConfig = {
-  saveRecords: true, // Save records
-  maxRequests: 1000,    // Allow 1000 requests
-  timeWindow: 3600,     // Per hour
-  scanThreshold: 20,     // Maximum 20 unique endpoints
+  maxRequests: 1000,      // Maximum 5 requests
+  timeWindow: 3600,       // In a 5-second window
+  scanThreshold: 20,    // Maximum 3 unique routes
+  saveRecords: true,   // Use Redis and MongoDB
   mongoURI: process.env.MONGO_URI, // MongoDB URI
   redisURL: process.env.REDIS_URL, // Redis URI
 };
@@ -17,13 +17,13 @@ const monitorConfig = {
 // Create monitor instance
 const { middleware, monitor } = APIMonitor(monitorConfig);
 
-// First apply the IP blocking middleware
-app.use(APIMonitor.blockIPs(monitorConfig));
+// Use the same monitor for IP blocking
+app.use((req, res, next) => monitor.blockIPsMiddleware(req, res, next));
 
 // Then apply the monitoring middleware
 app.use(middleware);
 
-// Example routes
+// Base route
 app.get('/', (req, res) => {
   res.json({ message: 'API working correctly' });
 });

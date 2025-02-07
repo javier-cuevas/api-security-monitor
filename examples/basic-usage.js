@@ -1,21 +1,21 @@
 const express = require('express');
 const APIMonitor = require('../src/index');
-require('dotenv').config();
 
 const app = express();
 
 // Basic configuration
 const basicConfig = {
-  saveRecords: false, // Save records
-  mongoURI: process.env.MONGO_URI, // MongoDB URI
-  redisURL: process.env.REDIS_URL // Redis URI
+  maxRequests: 5,      // Maximum 5 requests
+  timeWindow: 5,       // In a 5-second window
+  scanThreshold: 3,    // Maximum 3 unique routes
+  saveRecords: false   // Local storage
 };
 
 // Create monitor instance
 const { middleware, monitor } = APIMonitor(basicConfig);
 
-// First apply the IP blocking middleware
-app.use(APIMonitor.blockIPs(basicConfig));
+// Use the same monitor for IP blocking
+app.use((req, res, next) => monitor.blockIPsMiddleware(req, res, next));
 
 // Then apply the monitoring middleware
 app.use(middleware);

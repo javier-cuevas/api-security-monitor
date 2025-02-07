@@ -30,15 +30,25 @@ class APIMonitor extends EventEmitter {
    */
   constructor(options = {}) {
     super();
-    this.saveRecords = options.saveRecords || false;
     this.maxRequests = options.maxRequests || 10;
     this.timeWindow = options.timeWindow || 60;
     this.scanThreshold = options.scanThreshold || 5;
-    this.mongoURI = options.mongoURI || process.env.MONGO_URI;
-    this.redisURL = options.redisURL || process.env.REDIS_URL;
-
-    this.connectToMongo();
-    this.connectToRedis();
+    this.saveRecords = options.saveRecords || false;
+    
+    if (this.saveRecords) {
+      this.mongoURI = options.mongoURI || process.env.MONGO_URI;
+      this.redisURL = options.redisURL || process.env.REDIS_URL;
+      if (!this.mongoURI || !this.redisURL) {
+        throw new Error('mongoURI and redisURL are required when saveRecords is true');
+      }
+      this.connectToMongo();
+      this.connectToRedis();
+    } else {
+      // Initialize local data structures
+      this.localRequestCounts = new Map();
+      this.localRouteScans = new Map();
+      this.localBlockedIPs = new Map();
+    }
   }
 
   /**
@@ -115,12 +125,53 @@ class APIMonitor extends EventEmitter {
    * @param {Object} logData - Log data to save
    */
   async saveLog(logData) {
-    try {
-      const log = new this.LogModel(logData);
-      await log.save();
-    } catch (err) {
-      console.error('❌ Error saving log:', err);
+    // If there's an attack detected, always print it to console
+    if (logData.attackType) {
+      console.log('Attack log:', logData);
     }
+
+    // Save to MongoDB if saveRecords is true
+    if (this.saveRecords) {
+      try {
+        const log = new this.LogModel(logData);
+        await log.save();
+      } catch (err) {
+        console.error('❌ Error saving log:', err);
+      }
+    }
+  }
+
+  /**
+   * Checks and updates local request tracking
+   * @private
+   * @param {string} ip - IP address
+   * @param {string} route - Request route
+   * @returns {Object} Tracking info
+   */
+  updateLocalTracking(ip, route) {
+    const now = Date.now();
+    const windowStart = now - (this.timeWindow * 1000);
+
+    // Clear old records
+    if (!this.localRequestCounts.has(ip)) {
+      this.localRequestCounts.set(ip, []);
+    }
+    if (!this.localRouteScans.has(ip)) {
+      this.localRouteScans.set(ip, new Set());
+    }
+
+    // Filter old timestamps
+    const requests = this.localRequestCounts.get(ip).filter(time => time > windowStart);
+    requests.push(now);
+    this.localRequestCounts.set(ip, requests);
+
+    // Update unique routes
+    this.localRouteScans.get(ip).add(route);
+
+    return {
+      requestCount: requests.length,
+      scanCount: this.localRouteScans.get(ip).size
+    };
   }
 
   /**
@@ -134,55 +185,54 @@ class APIMonitor extends EventEmitter {
     const ip = this.getClientIP(req);
     const route = req.originalUrl;
     const method = req.method;
-    const requestKey = `req_count:${ip}`;
-    const scanKey = `scan_count:${ip}`;
 
-    // Count IP requests within time window
-    await this.redis.multi()
-      .incr(requestKey)
-      .expire(requestKey, this.timeWindow)
-      .exec();
-
-    await this.redis.sadd(scanKey, route);
-    await this.redis.expire(scanKey, this.timeWindow);
-
-    const requestCount = await this.redis.get(requestKey);
-    const scanCount = await this.redis.scard(scanKey);
-
-    let attackType = null;
-    if (requestCount > this.maxRequests) {
-      attackType = 'DDoS (Excessive Requests)';
-    } else if (scanCount > this.scanThreshold) {
-      attackType = 'Path Scanning';
+    // Check if IP is blocked before processing the request
+    const isBlocked = await this.isIPBlocked(ip);
+    if (isBlocked) {
+      const blockInfo = await this.getBlockInfo(ip);
+      return res.status(403).json(blockInfo);
     }
 
-    // Capture response data
+    if (this.saveRecords) {
+      const requestKey = `req_count:${ip}`;
+      const scanKey = `scan_count:${ip}`;
+
+      await this.redis.multi()
+        .incr(requestKey)
+        .expire(requestKey, this.timeWindow)
+        .exec();
+
+      await this.redis.sadd(scanKey, route);
+      await this.redis.expire(scanKey, this.timeWindow);
+
+      const requestCount = await this.redis.get(requestKey);
+      const scanCount = await this.redis.scard(scanKey);
+
+      await this.handleAttackDetection(ip, parseInt(requestCount), parseInt(scanCount));
+    } else {
+      const { requestCount, scanCount } = this.updateLocalTracking(ip, route);
+      await this.handleAttackDetection(ip, requestCount, scanCount);
+    }
+
     res.on('finish', async () => {
       const responseTime = Date.now() - start;
-      
-      // Prepare log data
-      const logData = {
-        ip,
-        method,
-        route,
-        timestamp: new Date(),
-        responseTime,
-        statusCode: res.statusCode,
-        userAgent: req.headers['user-agent'],
-        attackType
-      };
+      const isBlocked = await this.isIPBlocked(ip);
+      const attackType = isBlocked ? 'Blocked' : null;
 
-      // Save log to MongoDB
-      await this.saveLog(logData);
-
-      if (attackType) {
-        this.emit('attack-detected', {
+      // If saveRecords is true, save all logs
+      if (this.saveRecords || attackType || isBlocked) {
+        const logData = {
           ip,
-          type: attackType,
-          timestamp: new Date()
-        });
-        console.warn(`🚨 Possible attack detected: ${attackType} from IP ${ip}`);
-        await this.redis.set(`blocked:${ip}`, '1', 'EX', 300);
+          method,
+          route,
+          timestamp: new Date(),
+          responseTime,
+          statusCode: res.statusCode,
+          userAgent: req.headers['user-agent'],
+          attackType
+        };
+
+        await this.saveLog(logData);
       }
     });
 
@@ -190,17 +240,107 @@ class APIMonitor extends EventEmitter {
   }
 
   /**
-   * Middleware for blocking suspicious IPs
-   * @param {Object} req - Express request object
-   * @param {Object} res - Express response object
-   * @param {Function} next - Express next function
+   * Checks if an IP is blocked
+   * @private
+   * @param {string} ip - IP address to check
+   * @returns {boolean} True if IP is blocked
    */
+  async isIPBlocked(ip) {
+    if (this.saveRecords) {
+      try {
+        const isBlocked = await this.redis.get(`blocked:${ip}`);
+        return !!isBlocked;
+      } catch (err) {
+        console.error('Error checking blocked IP:', err);
+        return false;
+      }
+    } else {
+      const blockInfo = this.localBlockedIPs.get(ip);
+      if (!blockInfo) return false;
+      
+      const now = Date.now();
+      if (now >= blockInfo.expiresAt) {
+        this.localBlockedIPs.delete(ip);
+        return false;
+      }
+      return true;
+    }
+  }
+
+  async getBlockInfo(ip) {
+    if (this.saveRecords) {
+      const ttl = await this.redis.ttl(`blocked:${ip}`);
+      const reason = await this.redis.get(`blocked:${ip}:reason`);
+      return {
+        error: '🚫 Access denied due to suspicious activity',
+        reason: reason || 'Rate limit exceeded',
+        blockedFor: `${ttl} seconds`,
+        blockedUntil: new Date(Date.now() + (ttl * 1000)).toISOString()
+      };
+    } else {
+      const blockInfo = this.localBlockedIPs.get(ip);
+      const remainingTime = Math.ceil((blockInfo.expiresAt - Date.now()) / 1000);
+      return {
+        error: '🚫 Access denied due to suspicious activity',
+        reason: blockInfo.reason,
+        blockedFor: `${remainingTime} seconds`,
+        blockedUntil: new Date(blockInfo.expiresAt).toISOString()
+      };
+    }
+  }
+
+  async handleAttackDetection(ip, requestCount, scanCount) {
+    let attackType = null;
+    if (requestCount > this.maxRequests) {
+      attackType = 'DDoS (Excessive Requests)';
+    } else if (scanCount > this.scanThreshold) {
+      attackType = 'Path Scanning';
+    }
+
+    if (attackType) {
+      this.emit('attack-detected', {
+        ip,
+        type: attackType,
+        timestamp: new Date()
+      });
+      console.warn(`🚨 Possible attack detected: ${attackType} from IP ${ip}`);
+
+      if (this.saveRecords) {
+        await this.redis.multi()
+          .set(`blocked:${ip}`, '1', 'EX', 300)
+          .set(`blocked:${ip}:reason`, attackType, 'EX', 300)
+          .exec();
+      } else {
+        // Block IP locally for 5 minutes
+        this.localBlockedIPs.set(ip, {
+          expiresAt: Date.now() + (300 * 1000),
+          reason: attackType
+        });
+
+        // Clear tracking data
+        this.localRequestCounts.delete(ip);
+        this.localRouteScans.delete(ip);
+      }
+    }
+  }
+
+  /**
+   * Middleware for blocking suspicious IPs
+   * @param {Object} options - Configuration options
+   * @returns {Function} Express middleware function
+   */
+  static blockIPs(options) {
+    const monitor = new APIMonitor(options);
+    return (req, res, next) => monitor.blockIPsMiddleware(req, res, next);
+  }
+
   async blockIPsMiddleware(req, res, next) {
     const ip = this.getClientIP(req);
-    const isBlocked = await this.redis.get(`blocked:${ip}`);
-
+    const isBlocked = await this.isIPBlocked(ip);
+    
     if (isBlocked) {
-      return res.status(403).json({ error: '🚫 Access denied due to suspicious activity' });
+      const blockInfo = await this.getBlockInfo(ip);
+      return res.status(403).json(blockInfo);
     }
 
     next();
