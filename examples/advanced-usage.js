@@ -1,8 +1,12 @@
 const express = require('express');
 const APIMonitor = require('../src/index');
 require('dotenv').config();
+const cors = require('cors');
 
 const app = express();
+
+// Enable CORS for all routes
+app.use(cors());
 
 // Advanced configuration
 const monitorConfig = {
@@ -28,6 +32,30 @@ app.get('/', (req, res) => {
   res.json({ message: 'API working correctly' });
 });
 
+// Query logs with filters
+app.get('/logs', async (req, res) => {
+  try {
+    const { ip, attackType, startDate, endDate, limit = 10 } = req.query;
+    const query = {};
+
+    if (ip) query.ip = ip;
+    if (attackType) query.attackType = attackType;
+    if (startDate || endDate) {
+      query.timestamp = {};
+      if (startDate) query.timestamp.$gte = new Date(startDate);
+      if (endDate) query.timestamp.$lte = new Date(endDate);
+    }
+
+    const logs = await monitor.LogModel.find(query)
+      .sort({ timestamp: -1 })
+      .limit(parseInt(limit));
+
+    res.json(logs);
+  } catch (error) {
+    res.status(500).json({ error: 'Error fetching logs' });
+  }
+});
+
 // Advanced log queries
 app.get('/logs/stats', async (req, res) => {
   try {
@@ -51,27 +79,15 @@ app.get('/logs/stats', async (req, res) => {
   }
 });
 
-// Query logs with filters
-app.get('/logs', async (req, res) => {
+// Query attack logs route
+app.get('/logs/attacks', async (req, res) => {
   try {
-    const { ip, attackType, startDate, endDate, limit = 10 } = req.query;
-    const query = {};
-
-    if (ip) query.ip = ip;
-    if (attackType) query.attackType = attackType;
-    if (startDate || endDate) {
-      query.timestamp = {};
-      if (startDate) query.timestamp.$gte = new Date(startDate);
-      if (endDate) query.timestamp.$lte = new Date(endDate);
-    }
-
-    const logs = await monitor.LogModel.find(query)
-      .sort({ timestamp: -1 })
-      .limit(parseInt(limit));
-
-    res.json(logs);
+    const attackLogs = await monitor.LogModel.find({ 
+      attackType: { $ne: null } 
+    }).sort({ timestamp: -1 });
+    res.json(attackLogs);
   } catch (error) {
-    res.status(500).json({ error: 'Error fetching logs' });
+    res.status(500).json({ error: 'Error fetching attack logs' });
   }
 });
 

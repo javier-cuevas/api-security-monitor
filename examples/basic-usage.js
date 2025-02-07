@@ -1,13 +1,17 @@
 const express = require('express');
 const APIMonitor = require('../src/index');
+const cors = require('cors');
 
 const app = express();
 
+// Enable CORS for all routes
+app.use(cors());
+
 // Basic configuration
 const basicConfig = {
-  maxRequests: 5,      // Maximum 5 requests
-  timeWindow: 5,       // In a 5-second window
-  scanThreshold: 3,    // Maximum 3 unique routes
+  maxRequests: 10,      // Maximum 5 requests
+  timeWindow: 10,       // In a 5-second window
+  scanThreshold: 10,    // Maximum 3 unique routes
   saveRecords: false   // Local storage
 };
 
@@ -23,10 +27,6 @@ app.use(middleware);
 // Example routes
 app.get('/', (req, res) => {
   res.json({ message: 'API working correctly' });
-});
-
-app.get('/protected', (req, res) => {
-  res.json({ message: 'Protected route' });
 });
 
 // Query logs route
@@ -51,6 +51,11 @@ app.get('/logs/attacks', async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: 'Error fetching attack logs' });
   }
+});
+
+// Example routes
+app.get('/api/users', (req, res) => {
+  res.json({ users: [] });
 });
 
 // Listen for attack events

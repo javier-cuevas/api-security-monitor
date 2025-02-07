@@ -143,6 +143,18 @@ app.get('/logs/stats', async (req, res) => {
     res.status(500).json({ error: 'Error fetching stats' });
   }
 });
+
+// Query attack logs route
+app.get('/logs/attacks', async (req, res) => {
+  try {
+    const attackLogs = await monitor.LogModel.find({ 
+      attackType: { $ne: null } 
+    }).sort({ timestamp: -1 });
+    res.json(attackLogs);
+  } catch (error) {
+    res.status(500).json({ error: 'Error fetching attack logs' });
+  }
+});
 ```
 
 ## Configuration Options
