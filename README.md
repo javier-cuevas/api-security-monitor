@@ -9,8 +9,7 @@
 
 A robust middleware for monitoring and protecting Express.js APIs against common attacks, it can use logs in local storage or save them to Redis and MongoDB. This package provides real-time detection of DDoS attacks, scanning suspicious activities, and automatic IP blocking.
 
-Complement your development testing with our Chrome Extension: API Security Monitor Dashboard (only in Advanced Usage with Redis and MongoDB logs)
-[API Security Monitor Dashboard](https://api-security-monitor-dashboard.vercel.app/)
+Complement your development testing with our Chrome Extension: [API Security Monitor Dashboard](https://chromewebstore.google.com/detail/api-security-monitor-dash/bljgdebpoimjemfdnjmpjmjagbihpjfd) (only in Advanced Usage with Redis and MongoDB logs)
 
 ## Features
 
