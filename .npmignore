@@ -25,6 +25,7 @@ CONTRIBUTING.md
 
 # Misc
 *.log
+*.ndjson
 .DS_Store
 .env* 
 

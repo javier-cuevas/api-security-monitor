@@ -1,131 +1,222 @@
+/**
+ * advanced-usage.js — Redis + MongoDB mode
+ *
+ * All endpoints return the same JSON shape as basic-usage.js so the
+ * Chrome Extension Dashboard works with both modes without any changes.
+ *
+ * Data sources in advanced mode:
+ *   - Active blocks  → Redis (blocked:<ip> keys)
+ *   - Full log history → MongoDB (every request is stored)
+ */
+
 const express = require('express');
 const APIMonitor = require('../src/index');
+const mongoSanitize = require('express-mongo-sanitize');
 require('dotenv').config();
 const cors = require('cors');
 
 const app = express();
 
-// Enable CORS for all routes
 app.use(cors());
 
-// Advanced configuration
-const monitorConfig = {
-  maxRequests: 1000,      // Maximum 5 requests
-  timeWindow: 3600,       // In a 5-second window
-  scanThreshold: 20,    // Maximum 3 unique routes
-  saveRecords: true,   // Use Redis and MongoDB
-  mongoURI: process.env.MONGO_URI, // MongoDB URI
-  redisURL: process.env.REDIS_URL, // Redis URI
-};
+// Trust one upstream proxy (e.g. nginx, AWS ALB).
+// Adjust the value to match your infrastructure:
+//   app.set('trust proxy', 1)            → trust one hop
+//   app.set('trust proxy', '10.0.0.1')   → trust a specific proxy IP
+app.set('trust proxy', 1);
 
-// Create monitor instance
-const { middleware, monitor } = APIMonitor(monitorConfig);
+app.use(express.json());
 
-// Use the same monitor for IP blocking
-app.use((req, res, next) => monitor.blockIPsMiddleware(req, res, next));
+// Strip MongoDB operators ($gt, $ne, etc.) from all incoming data
+// to prevent NoSQL injection on query/body/params.
+app.use(mongoSanitize());
 
-// Then apply the monitoring middleware
+const { middleware, blockIPs, monitor } = APIMonitor({
+  maxRequests:   1000,
+  timeWindow:    3600,
+  scanThreshold: 20,
+  saveRecords:   true,
+  mongoURI:      process.env.MONGO_URI,
+  redisURL:      process.env.REDIS_URL,
+});
+
+// 1. Reject already-blocked IPs as early as possible
+app.use(blockIPs);
+
+// 2. Track requests and detect new attacks
 app.use(middleware);
 
-// Base route
+// ---------------------------------------------------------------------------
+// API routes
+// ---------------------------------------------------------------------------
+
 app.get('/', (req, res) => {
   res.json({ message: 'API working correctly' });
 });
 
-// Query logs with filters
+app.get('/api/users',    (req, res) => res.json({ users: [] }));
+app.get('/api/products', (req, res) => res.json({ products: [] }));
+
+/**
+ * GET /logs
+ * Recent log entries with optional filters.
+ * Supports: ip, attackType, startDate, endDate, limit (max 100).
+ * Same shape as basic-usage /logs.
+ */
 app.get('/logs', async (req, res) => {
   try {
-    const { ip, attackType, startDate, endDate, limit = 10 } = req.query;
+    const { ip, attackType, startDate, endDate } = req.query;
+    const limit = Math.min(parseInt(req.query.limit) || 10, 100);
     const query = {};
 
-    if (ip) query.ip = ip;
-    if (attackType) query.attackType = attackType;
+    if (ip !== undefined) {
+      if (typeof ip !== 'string') return res.status(400).json({ error: 'Invalid ip parameter' });
+      query.ip = ip;
+    }
+    if (attackType !== undefined) {
+      if (typeof attackType !== 'string') return res.status(400).json({ error: 'Invalid attackType parameter' });
+      query.attackType = attackType;
+    }
     if (startDate || endDate) {
       query.timestamp = {};
-      if (startDate) query.timestamp.$gte = new Date(startDate);
-      if (endDate) query.timestamp.$lte = new Date(endDate);
+      if (startDate) {
+        const d = new Date(startDate);
+        if (isNaN(d.getTime())) return res.status(400).json({ error: 'Invalid startDate' });
+        query.timestamp.$gte = d;
+      }
+      if (endDate) {
+        const d = new Date(endDate);
+        if (isNaN(d.getTime())) return res.status(400).json({ error: 'Invalid endDate' });
+        query.timestamp.$lte = d;
+      }
     }
 
     const logs = await monitor.LogModel.find(query)
       .sort({ timestamp: -1 })
-      .limit(parseInt(limit));
+      .limit(limit)
+      .lean();
 
     res.json(logs);
-  } catch (error) {
+  } catch (err) {
     res.status(500).json({ error: 'Error fetching logs' });
   }
 });
 
-// Advanced log queries
+/**
+ * GET /logs/attacks
+ * Attack-only log entries (attackType != null), most recent first.
+ * Supports: limit (max 100).
+ * Same shape as basic-usage /logs/attacks.
+ */
+app.get('/logs/attacks', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+
+    const logs = await monitor.LogModel
+      .find({ attackType: { $ne: null } })
+      .sort({ timestamp: -1 })
+      .limit(limit)
+      .lean();
+
+    res.json(logs);
+  } catch (err) {
+    res.status(500).json({ error: 'Error fetching attack logs' });
+  }
+});
+
+/**
+ * GET /logs/stats
+ * Per-IP statistics: total requests, average response time, attack count, unique routes.
+ * Same shape as basic-usage /logs/stats ({ _id, totalRequests, avgResponseTime, attackCount, routes }).
+ */
 app.get('/logs/stats', async (req, res) => {
   try {
     const stats = await monitor.LogModel.aggregate([
       {
         $group: {
-          _id: '$ip',
-          totalRequests: { $sum: 1 },
+          _id:             '$ip',
+          totalRequests:   { $sum: 1 },
           avgResponseTime: { $avg: '$responseTime' },
           attackCount: {
-            $sum: { $cond: [{ $ne: ['$attackType', null] }, 1, 0] }
+            $sum: { $cond: [{ $ne: ['$attackType', null] }, 1, 0] },
           },
-          routes: { $addToSet: '$route' }
-        }
+          routes: { $addToSet: '$route' },
+        },
       },
-      { $sort: { totalRequests: -1 } }
+      { $sort: { totalRequests: -1 } },
     ]);
+
     res.json(stats);
-  } catch (error) {
+  } catch (err) {
     res.status(500).json({ error: 'Error fetching stats' });
   }
 });
 
-// Query attack logs route
-app.get('/logs/attacks', async (req, res) => {
+/**
+ * GET /blocked
+ * Currently blocked IPs with remaining TTL, sourced from Redis.
+ * Same shape as basic-usage /blocked ({ count, blocked: [{ ip, reason, remainingSec, blockedUntil }] }).
+ */
+app.get('/blocked', async (req, res) => {
   try {
-    const attackLogs = await monitor.LogModel.find({ 
-      attackType: { $ne: null } 
-    }).sort({ timestamp: -1 });
-    res.json(attackLogs);
-  } catch (error) {
-    res.status(500).json({ error: 'Error fetching attack logs' });
+    const now     = Date.now();
+    const blocked = [];
+    let cursor    = '0';
+
+    // Scan Redis for blocked:<ip> keys (skip blocked:<ip>:reason keys)
+    do {
+      const [next, keys] = await monitor.redis.scan(cursor, 'MATCH', 'blocked:*', 'COUNT', 100);
+      cursor = next;
+
+      for (const key of keys) {
+        if (key.endsWith(':reason')) continue;
+
+        const ttl    = await monitor.redis.ttl(key);
+        const reason = await monitor.redis.get(`${key}:reason`);
+
+        if (ttl > 0) {
+          blocked.push({
+            ip:           key.replace('blocked:', ''),
+            reason:       reason || 'Unknown',
+            remainingSec: ttl,
+            blockedUntil: new Date(now + ttl * 1000).toISOString(),
+          });
+        }
+      }
+    } while (cursor !== '0');
+
+    res.json({ count: blocked.length, blocked });
+  } catch (err) {
+    res.status(500).json({ error: 'Error fetching blocked IPs' });
   }
 });
 
-// Example routes
-app.get('/api/users', (req, res) => {
-  res.json({ users: [] });
+// ---------------------------------------------------------------------------
+// Attack event listener
+// ---------------------------------------------------------------------------
+
+monitor.on('attack-detected', ({ ip, type, timestamp }) => {
+  console.log('Attack detected:', { ip, type, time: new Date(timestamp) });
+  // Add custom logic here:
+  // - Send notifications (Slack, PagerDuty, etc.)
+  // - Forward to an external logging service
+  // - Update metrics / dashboards
 });
 
-app.get('/api/products', (req, res) => {
-  res.json({ products: [] });
-});
+// ---------------------------------------------------------------------------
+// Error handler
+// ---------------------------------------------------------------------------
 
-// Listen for attack events
-monitor.on('attack-detected', (data) => {
-  console.log('🚨 Attack detected:', {
-    ip: data.ip,
-    type: data.type,
-    timestamp: new Date(data.timestamp),
-    details: {
-      maxRequestsAllowed: monitorConfig.maxRequests,
-      timeWindow: `${monitorConfig.timeWindow} seconds`,
-      scanThreshold: monitorConfig.scanThreshold
-    }
-  });
-  
-  // Here you could add additional logic like:
-  // - Send notifications
-  // - Log to external services
-  // - Update metrics
-});
-
-// Error handling
 app.use((err, req, res, next) => {
   console.error('Error:', err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Advanced server running on port ${PORT}`);
-}); 
+});
