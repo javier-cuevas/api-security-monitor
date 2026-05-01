@@ -142,6 +142,7 @@ class APIMonitor extends EventEmitter {
             this.localBlockedIPs.set(entry.ip, {
               expiresAt: entry.expiresAt,
               reason:    entry.reason,
+              route:     entry.route || null,
             });
           }
         } catch {
@@ -304,7 +305,7 @@ class APIMonitor extends EventEmitter {
         await this.handleAttackDetection(ip, parseInt(requestCount), parseInt(scanCount));
       } else {
         const { requestCount, scanCount } = this.updateLocalTracking(ip, route);
-        await this.handleAttackDetection(ip, requestCount, scanCount);
+        await this.handleAttackDetection(ip, requestCount, scanCount, route);
       }
 
       res.on('finish', async () => {
@@ -392,7 +393,7 @@ class APIMonitor extends EventEmitter {
     };
   }
 
-  async handleAttackDetection(ip, requestCount, scanCount) {
+  async handleAttackDetection(ip, requestCount, scanCount, route) {
     let attackType = null;
     if (requestCount > this.maxRequests) {
       attackType = 'DDoS (Excessive Requests)';
@@ -413,11 +414,12 @@ class APIMonitor extends EventEmitter {
     } else {
       const expiresAt = Date.now() + 300_000; // 5 minutes
 
-      this.localBlockedIPs.set(ip, { expiresAt, reason: attackType });
+      this.localBlockedIPs.set(ip, { expiresAt, reason: attackType, route: route || null });
       this._appendBlockLog({
         timestamp: new Date().toISOString(),
         ip,
         reason:    attackType,
+        route:     route || null,
         expiresAt,
         action:    'block',
       });
@@ -440,6 +442,182 @@ class APIMonitor extends EventEmitter {
     } catch (err) {
       next(err);
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Query methods
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Reads and parses all valid lines from the NDJSON block log (local mode only).
+   * @private
+   * @returns {Object[]}
+   */
+  _readBlockLog() {
+    if (!this.blockLogPath || !fs.existsSync(this.blockLogPath)) return [];
+    return fs.readFileSync(this.blockLogPath, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .flatMap(line => {
+        try { return [JSON.parse(line)]; } catch { return []; }
+      });
+  }
+
+  /**
+   * Converts an NDJSON block entry to the common log-entry shape.
+   * Fields only available in advanced mode are set to null.
+   * @private
+   */
+  _toLogShape(entry) {
+    return {
+      ip:           entry.ip,
+      method:       null,
+      route:        entry.route || null,
+      timestamp:    entry.timestamp,
+      responseTime: null,
+      statusCode:   null,
+      userAgent:    null,
+      attackType:   entry.action === 'block' ? entry.reason : null,
+    };
+  }
+
+  /**
+   * Returns filtered log entries. Works in both local and Redis+MongoDB modes.
+   * @param {Object} [opts]
+   * @param {string} [opts.ip]
+   * @param {string} [opts.attackType]
+   * @param {string} [opts.startDate]
+   * @param {string} [opts.endDate]
+   * @param {number} [opts.limit=10]
+   * @returns {Promise<Object[]>}
+   */
+  async getLogs({ ip, attackType, startDate, endDate, limit = 10 } = {}) {
+    if (this.saveRecords) {
+      const query = {};
+      if (ip !== undefined)         query.ip         = ip;
+      if (attackType !== undefined) query.attackType = attackType;
+      if (startDate || endDate) {
+        query.timestamp = {};
+        if (startDate) query.timestamp.$gte = new Date(startDate);
+        if (endDate)   query.timestamp.$lte = new Date(endDate);
+      }
+      return this.LogModel.find(query).sort({ timestamp: -1 }).limit(limit).lean();
+    }
+
+    let entries = this._readBlockLog().filter(e => e.action === 'block');
+    if (ip)         entries = entries.filter(e => e.ip === ip);
+    if (attackType) entries = entries.filter(e => e.reason === attackType);
+    if (startDate)  entries = entries.filter(e => new Date(e.timestamp) >= new Date(startDate));
+    if (endDate)    entries = entries.filter(e => new Date(e.timestamp) <= new Date(endDate));
+    return entries.reverse().slice(0, limit).map(e => this._toLogShape(e));
+  }
+
+  /**
+   * Returns attack-only log entries (attackType != null), most recent first.
+   * @param {Object} [opts]
+   * @param {number} [opts.limit=50]
+   * @returns {Promise<Object[]>}
+   */
+  async getAttackLogs({ limit = 50 } = {}) {
+    if (this.saveRecords) {
+      return this.LogModel
+        .find({ attackType: { $ne: null } })
+        .sort({ timestamp: -1 })
+        .limit(limit)
+        .lean();
+    }
+
+    return this._readBlockLog()
+      .filter(e => e.action === 'block')
+      .reverse()
+      .slice(0, limit)
+      .map(e => this._toLogShape(e));
+  }
+
+  /**
+   * Returns per-IP attack statistics.
+   * Shape: { _id, totalRequests, avgResponseTime, attackCount, routes }
+   * totalRequests and avgResponseTime are null in local mode.
+   * @returns {Promise<Object[]>}
+   */
+  async getStats() {
+    if (this.saveRecords) {
+      return this.LogModel.aggregate([
+        {
+          $group: {
+            _id:             '$ip',
+            totalRequests:   { $sum: 1 },
+            avgResponseTime: { $avg: '$responseTime' },
+            attackCount: {
+              $sum: { $cond: [{ $ne: ['$attackType', null] }, 1, 0] },
+            },
+            routes: { $addToSet: '$route' },
+          },
+        },
+        { $sort: { totalRequests: -1 } },
+      ]);
+    }
+
+    const byIP = {};
+    for (const entry of this._readBlockLog().filter(e => e.action === 'block')) {
+      if (!byIP[entry.ip]) {
+        byIP[entry.ip] = {
+          _id:             entry.ip,
+          totalRequests:   null,
+          avgResponseTime: null,
+          attackCount:     0,
+          routes:          [],
+        };
+      }
+      byIP[entry.ip].attackCount++;
+    }
+    return Object.values(byIP).sort((a, b) => b.attackCount - a.attackCount);
+  }
+
+  /**
+   * Returns currently blocked IPs with remaining TTL.
+   * Shape: { count, blocked: [{ ip, reason, remainingSec, blockedUntil }] }
+   * @returns {Promise<Object>}
+   */
+  async getBlockedIPs() {
+    const now     = Date.now();
+    const blocked = [];
+
+    if (this.saveRecords) {
+      let cursor = '0';
+      do {
+        const [next, keys] = await this.redis.scan(cursor, 'MATCH', 'blocked:*', 'COUNT', 100);
+        cursor = next;
+
+        for (const key of keys) {
+          if (key.endsWith(':reason')) continue;
+          const ttl    = await this.redis.ttl(key);
+          const reason = await this.redis.get(`${key}:reason`);
+          if (ttl > 0) {
+            blocked.push({
+              ip:           key.replace('blocked:', ''),
+              reason:       reason || 'Unknown',
+              remainingSec: ttl,
+              blockedUntil: new Date(now + ttl * 1000).toISOString(),
+            });
+          }
+        }
+      } while (cursor !== '0');
+    } else {
+      for (const [ip, info] of this.localBlockedIPs) {
+        if (info.expiresAt > now) {
+          blocked.push({
+            ip,
+            reason:       info.reason,
+            route:        info.route || null,
+            remainingSec: Math.ceil((info.expiresAt - now) / 1000),
+            blockedUntil: new Date(info.expiresAt).toISOString(),
+          });
+        }
+      }
+    }
+
+    return { count: blocked.length, blocked };
   }
 }
 

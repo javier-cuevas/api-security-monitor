@@ -16,7 +16,6 @@
 const express = require('express');
 const APIMonitor = require('../src/index');
 const cors = require('cors');
-const fs   = require('fs');
 const path = require('path');
 
 const app = express();
@@ -47,38 +46,6 @@ app.use(blockIPs);
 app.use(middleware);
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Read and parse all valid lines from the NDJSON block log. */
-function readLog() {
-  if (!fs.existsSync(BLOCK_LOG)) return [];
-  return fs.readFileSync(BLOCK_LOG, 'utf8')
-    .split('\n')
-    .filter(Boolean)
-    .flatMap(line => {
-      try { return [JSON.parse(line)]; } catch { return []; }
-    });
-}
-
-/**
- * Convert an NDJSON block entry to the common log-entry shape.
- * Fields only available in advanced mode are set to null.
- */
-function toLogShape(entry) {
-  return {
-    ip:           entry.ip,
-    method:       null,
-    route:        null,
-    timestamp:    entry.timestamp,
-    responseTime: null,
-    statusCode:   null,
-    userAgent:    null,
-    attackType:   entry.action === 'block' ? entry.reason : null,
-  };
-}
-
-// ---------------------------------------------------------------------------
 // API routes
 // ---------------------------------------------------------------------------
 
@@ -92,54 +59,32 @@ app.get('/api/products', (req, res) => res.json({ products: [] }));
 /**
  * GET /logs
  * Recent log entries. Supports query params: ip, attackType, startDate, endDate, limit.
- * Same shape as advanced-usage /logs.
  */
-app.get('/logs', (req, res) => {
+app.get('/logs', async (req, res) => {
   try {
     const { ip, attackType, startDate, endDate } = req.query;
     const limit = Math.min(parseInt(req.query.limit) || 10, 100);
 
-    let entries = readLog().filter(e => e.action === 'block');
+    if (startDate && isNaN(new Date(startDate))) return res.status(400).json({ error: 'Invalid startDate' });
+    if (endDate   && isNaN(new Date(endDate)))   return res.status(400).json({ error: 'Invalid endDate' });
 
-    if (typeof ip === 'string')
-      entries = entries.filter(e => e.ip === ip);
-    if (typeof attackType === 'string')
-      entries = entries.filter(e => e.reason === attackType);
-    if (startDate) {
-      const d = new Date(startDate);
-      if (isNaN(d)) return res.status(400).json({ error: 'Invalid startDate' });
-      entries = entries.filter(e => new Date(e.timestamp) >= d);
-    }
-    if (endDate) {
-      const d = new Date(endDate);
-      if (isNaN(d)) return res.status(400).json({ error: 'Invalid endDate' });
-      entries = entries.filter(e => new Date(e.timestamp) <= d);
-    }
-
-    // Most recent first, capped at limit
-    const logs = entries.reverse().slice(0, limit).map(toLogShape);
+    const logs = await monitor.getLogs({ ip, attackType, startDate, endDate, limit });
     res.json(logs);
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: 'Error fetching logs' });
   }
 });
 
 /**
  * GET /logs/attacks
- * Attack-only log entries (same shape as /logs, filtered to attackType != null).
- * Same shape as advanced-usage /logs/attacks.
+ * Attack-only log entries (attackType != null), most recent first.
  */
-app.get('/logs/attacks', (req, res) => {
+app.get('/logs/attacks', async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);
-    const entries = readLog()
-      .filter(e => e.action === 'block')
-      .reverse()
-      .slice(0, limit)
-      .map(toLogShape);
-
-    res.json(entries);
-  } catch (err) {
+    const logs = await monitor.getAttackLogs({ limit });
+    res.json(logs);
+  } catch {
     res.status(500).json({ error: 'Error fetching attack logs' });
   }
 });
@@ -147,29 +92,12 @@ app.get('/logs/attacks', (req, res) => {
 /**
  * GET /logs/stats
  * Per-IP attack statistics.
- * Same shape as advanced-usage /logs/stats ({ _id, totalRequests, avgResponseTime, attackCount, routes }).
- * totalRequests and avgResponseTime are null in local mode (requests are not individually logged).
  */
-app.get('/logs/stats', (req, res) => {
+app.get('/logs/stats', async (req, res) => {
   try {
-    const byIP = {};
-
-    for (const entry of readLog().filter(e => e.action === 'block')) {
-      if (!byIP[entry.ip]) {
-        byIP[entry.ip] = {
-          _id:             entry.ip,
-          totalRequests:   null,   // not tracked in local mode
-          avgResponseTime: null,   // not tracked in local mode
-          attackCount:     0,
-          routes:          [],     // not tracked in local mode
-        };
-      }
-      byIP[entry.ip].attackCount++;
-    }
-
-    const stats = Object.values(byIP).sort((a, b) => b.attackCount - a.attackCount);
+    const stats = await monitor.getStats();
     res.json(stats);
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: 'Error fetching stats' });
   }
 });
@@ -177,24 +105,14 @@ app.get('/logs/stats', (req, res) => {
 /**
  * GET /blocked
  * Currently blocked IPs with remaining TTL.
- * Same shape as advanced-usage /blocked.
  */
-app.get('/blocked', (req, res) => {
-  const now     = Date.now();
-  const blocked = [];
-
-  for (const [ip, info] of monitor.localBlockedIPs) {
-    if (info.expiresAt > now) {
-      blocked.push({
-        ip,
-        reason:       info.reason,
-        remainingSec: Math.ceil((info.expiresAt - now) / 1000),
-        blockedUntil: new Date(info.expiresAt).toISOString(),
-      });
-    }
+app.get('/blocked', async (req, res) => {
+  try {
+    const result = await monitor.getBlockedIPs();
+    res.json(result);
+  } catch {
+    res.status(500).json({ error: 'Error fetching blocked IPs' });
   }
-
-  res.json({ count: blocked.length, blocked });
 });
 
 // ---------------------------------------------------------------------------

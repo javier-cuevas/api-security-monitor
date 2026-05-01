@@ -61,43 +61,20 @@ app.get('/api/products', (req, res) => res.json({ products: [] }));
  * GET /logs
  * Recent log entries with optional filters.
  * Supports: ip, attackType, startDate, endDate, limit (max 100).
- * Same shape as basic-usage /logs.
  */
 app.get('/logs', async (req, res) => {
   try {
     const { ip, attackType, startDate, endDate } = req.query;
     const limit = Math.min(parseInt(req.query.limit) || 10, 100);
-    const query = {};
 
-    if (ip !== undefined) {
-      if (typeof ip !== 'string') return res.status(400).json({ error: 'Invalid ip parameter' });
-      query.ip = ip;
-    }
-    if (attackType !== undefined) {
-      if (typeof attackType !== 'string') return res.status(400).json({ error: 'Invalid attackType parameter' });
-      query.attackType = attackType;
-    }
-    if (startDate || endDate) {
-      query.timestamp = {};
-      if (startDate) {
-        const d = new Date(startDate);
-        if (isNaN(d.getTime())) return res.status(400).json({ error: 'Invalid startDate' });
-        query.timestamp.$gte = d;
-      }
-      if (endDate) {
-        const d = new Date(endDate);
-        if (isNaN(d.getTime())) return res.status(400).json({ error: 'Invalid endDate' });
-        query.timestamp.$lte = d;
-      }
-    }
+    if (ip !== undefined && typeof ip !== 'string')               return res.status(400).json({ error: 'Invalid ip parameter' });
+    if (attackType !== undefined && typeof attackType !== 'string') return res.status(400).json({ error: 'Invalid attackType parameter' });
+    if (startDate && isNaN(new Date(startDate).getTime()))        return res.status(400).json({ error: 'Invalid startDate' });
+    if (endDate   && isNaN(new Date(endDate).getTime()))          return res.status(400).json({ error: 'Invalid endDate' });
 
-    const logs = await monitor.LogModel.find(query)
-      .sort({ timestamp: -1 })
-      .limit(limit)
-      .lean();
-
+    const logs = await monitor.getLogs({ ip, attackType, startDate, endDate, limit });
     res.json(logs);
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: 'Error fetching logs' });
   }
 });
@@ -106,20 +83,13 @@ app.get('/logs', async (req, res) => {
  * GET /logs/attacks
  * Attack-only log entries (attackType != null), most recent first.
  * Supports: limit (max 100).
- * Same shape as basic-usage /logs/attacks.
  */
 app.get('/logs/attacks', async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);
-
-    const logs = await monitor.LogModel
-      .find({ attackType: { $ne: null } })
-      .sort({ timestamp: -1 })
-      .limit(limit)
-      .lean();
-
+    const logs = await monitor.getAttackLogs({ limit });
     res.json(logs);
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: 'Error fetching attack logs' });
   }
 });
@@ -127,27 +97,12 @@ app.get('/logs/attacks', async (req, res) => {
 /**
  * GET /logs/stats
  * Per-IP statistics: total requests, average response time, attack count, unique routes.
- * Same shape as basic-usage /logs/stats ({ _id, totalRequests, avgResponseTime, attackCount, routes }).
  */
 app.get('/logs/stats', async (req, res) => {
   try {
-    const stats = await monitor.LogModel.aggregate([
-      {
-        $group: {
-          _id:             '$ip',
-          totalRequests:   { $sum: 1 },
-          avgResponseTime: { $avg: '$responseTime' },
-          attackCount: {
-            $sum: { $cond: [{ $ne: ['$attackType', null] }, 1, 0] },
-          },
-          routes: { $addToSet: '$route' },
-        },
-      },
-      { $sort: { totalRequests: -1 } },
-    ]);
-
+    const stats = await monitor.getStats();
     res.json(stats);
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: 'Error fetching stats' });
   }
 });
@@ -155,38 +110,12 @@ app.get('/logs/stats', async (req, res) => {
 /**
  * GET /blocked
  * Currently blocked IPs with remaining TTL, sourced from Redis.
- * Same shape as basic-usage /blocked ({ count, blocked: [{ ip, reason, remainingSec, blockedUntil }] }).
  */
 app.get('/blocked', async (req, res) => {
   try {
-    const now     = Date.now();
-    const blocked = [];
-    let cursor    = '0';
-
-    // Scan Redis for blocked:<ip> keys (skip blocked:<ip>:reason keys)
-    do {
-      const [next, keys] = await monitor.redis.scan(cursor, 'MATCH', 'blocked:*', 'COUNT', 100);
-      cursor = next;
-
-      for (const key of keys) {
-        if (key.endsWith(':reason')) continue;
-
-        const ttl    = await monitor.redis.ttl(key);
-        const reason = await monitor.redis.get(`${key}:reason`);
-
-        if (ttl > 0) {
-          blocked.push({
-            ip:           key.replace('blocked:', ''),
-            reason:       reason || 'Unknown',
-            remainingSec: ttl,
-            blockedUntil: new Date(now + ttl * 1000).toISOString(),
-          });
-        }
-      }
-    } while (cursor !== '0');
-
-    res.json({ count: blocked.length, blocked });
-  } catch (err) {
+    const result = await monitor.getBlockedIPs();
+    res.json(result);
+  } catch {
     res.status(500).json({ error: 'Error fetching blocked IPs' });
   }
 });
