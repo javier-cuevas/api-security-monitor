@@ -44,6 +44,8 @@ class APIMonitor extends EventEmitter {
       if (!this.mongoURI || !this.redisURL) {
         throw new Error('mongoURI and redisURL are required when saveRecords is true');
       }
+      // Initialize model immediately so logging calls don't race Mongo connect.
+      this.LogModel = mongoose.models.RequestLog || mongoose.model('RequestLog', LogSchema);
       this.connectToMongo();
       this.connectToRedis();
     } else {
@@ -163,7 +165,7 @@ class APIMonitor extends EventEmitter {
     try {
       await mongoose.connect(this.mongoURI);
       console.log('Connected to MongoDB');
-      this.LogModel = mongoose.model('RequestLog', LogSchema);
+      this.LogModel = mongoose.models.RequestLog || mongoose.model('RequestLog', LogSchema);
     } catch (err) {
       console.error('MongoDB Error:', err);
     }
@@ -255,6 +257,8 @@ class APIMonitor extends EventEmitter {
     }
     if (this.saveRecords) {
       try {
+        // Avoid Mongoose buffering timeouts when connection is not ready.
+        if (!this.LogModel || mongoose.connection.readyState !== 1) return;
         const log = new this.LogModel(logData);
         await log.save();
       } catch (err) {
