@@ -118,7 +118,7 @@ Every block and unblock event is appended as a single JSON line
 ([NDJSON / JSON Lines](https://jsonlines.org/)):
 
 ```
-{"timestamp":"2025-04-30T14:10:00.000Z","ip":"1.2.3.4","action":"block","reason":"DDoS (Excessive Requests)","expiresAt":1746020400000}
+{"timestamp":"2025-04-30T14:10:00.000Z","ip":"1.2.3.4","action":"block","reason":"DDoS (Excessive Requests)","route":"/api/users","expiresAt":1746020400000}
 {"timestamp":"2025-04-30T14:15:00.000Z","ip":"1.2.3.4","action":"unblock","reason":"ttl_expired"}
 ```
 
@@ -128,6 +128,7 @@ Every block and unblock event is appended as a single JSON line
 | `ip` | block + unblock | Client IP address |
 | `action` | block + unblock | `"block"` or `"unblock"` |
 | `reason` | block + unblock | Attack type or `"ttl_expired"` |
+| `route` | block only | Request path that triggered the block |
 | `expiresAt` | block only | Unix-ms timestamp when the block expires |
 
 ### Compatibility with security tools
@@ -160,27 +161,54 @@ datepattern = "timestamp":"%%Y-%%m-%%dT%%H:%%M:%%S
 **Filebeat / Logstash / ELK** — point the input at the file path; each line is parsed
 as a JSON document automatically.
 
-### Querying active blocks from your app
+### Dashboard endpoints
+
+All four dashboard endpoints use the same monitor methods in both local and advanced mode:
 
 ```javascript
-app.get('/blocked', (req, res) => {
-  const now     = Date.now();
-  const blocked = [];
+app.get('/logs', async (req, res) => {
+  try {
+    const { ip, attackType, startDate, endDate } = req.query;
+    const limit = Math.min(parseInt(req.query.limit) || 10, 100);
 
-  for (const [ip, info] of monitor.localBlockedIPs) {
-    if (info.expiresAt > now) {
-      blocked.push({
-        ip,
-        reason:       info.reason,
-        remainingSec: Math.ceil((info.expiresAt - now) / 1000),
-        blockedUntil: new Date(info.expiresAt).toISOString(),
-      });
-    }
+    if (startDate && isNaN(new Date(startDate))) return res.status(400).json({ error: 'Invalid startDate' });
+    if (endDate   && isNaN(new Date(endDate)))   return res.status(400).json({ error: 'Invalid endDate' });
+
+    res.json(await monitor.getLogs({ ip, attackType, startDate, endDate, limit }));
+  } catch {
+    res.status(500).json({ error: 'Error fetching logs' });
   }
+});
 
-  res.json({ count: blocked.length, blocked });
+app.get('/logs/attacks', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+    res.json(await monitor.getAttackLogs({ limit }));
+  } catch {
+    res.status(500).json({ error: 'Error fetching attack logs' });
+  }
+});
+
+app.get('/logs/stats', async (req, res) => {
+  try {
+    res.json(await monitor.getStats());
+  } catch {
+    res.status(500).json({ error: 'Error fetching stats' });
+  }
+});
+
+app.get('/blocked', async (req, res) => {
+  try {
+    res.json(await monitor.getBlockedIPs());
+  } catch {
+    res.status(500).json({ error: 'Error fetching blocked IPs' });
+  }
 });
 ```
+
+> In local mode (`saveRecords: false`) the methods read from `localBlockedIPs` and the NDJSON block log.
+> In advanced mode (`saveRecords: true`) they query Redis and MongoDB.
+> The response shape is identical in both modes.
 
 ---
 
@@ -192,10 +220,15 @@ This also unlocks the Chrome Extension dashboard.
 ```javascript
 const express = require('express');
 const APIMonitor = require('api-security-monitor');
+const mongoSanitize = require('express-mongo-sanitize');
+require('dotenv').config();
 
 const app = express();
 
 app.set('trust proxy', 1);
+app.use(express.json());
+// Strip MongoDB operators from all incoming data to prevent NoSQL injection
+app.use(mongoSanitize());
 
 const { middleware, blockIPs, monitor } = APIMonitor({
   maxRequests:   1000,
@@ -206,33 +239,17 @@ const { middleware, blockIPs, monitor } = APIMonitor({
   redisURL:      process.env.REDIS_URL,
 });
 
+// 1. Reject already-blocked IPs as early as possible
 app.use(blockIPs);
+
+// 2. Track requests and detect new attacks
 app.use(middleware);
 
-// Query stored logs
-app.get('/logs', async (req, res) => {
-  try {
-    const { ip, attackType, startDate, endDate } = req.query;
-    const limit = Math.min(parseInt(req.query.limit) || 10, 100);
-    const query = {};
-
-    if (typeof ip === 'string')         query.ip = ip;
-    if (typeof attackType === 'string') query.attackType = attackType;
-    if (startDate || endDate) {
-      query.timestamp = {};
-      if (startDate) query.timestamp.$gte = new Date(startDate);
-      if (endDate)   query.timestamp.$lte = new Date(endDate);
-    }
-
-    const logs = await monitor.LogModel.find(query)
-      .sort({ timestamp: -1 })
-      .limit(limit);
-
-    res.json(logs);
-  } catch (err) {
-    res.status(500).json({ error: 'Error fetching logs' });
-  }
-});
+// Mount dashboard endpoints (same methods as local mode)
+app.get('/logs',         async (req, res) => { /* see Dashboard endpoints above */ });
+app.get('/logs/attacks', async (req, res) => { /* see Dashboard endpoints above */ });
+app.get('/logs/stats',   async (req, res) => { /* see Dashboard endpoints above */ });
+app.get('/blocked',      async (req, res) => { /* see Dashboard endpoints above */ });
 
 app.listen(3000);
 ```
@@ -349,6 +366,7 @@ Response:
     {
       "ip": "1.2.3.4",
       "reason": "DDoS (Excessive Requests)",
+      "route": "/api/users",
       "remainingSec": 245,
       "blockedUntil": "2025-04-30T14:15:00.000Z"
     }
@@ -363,8 +381,8 @@ Response:
 | `ip` | available | available |
 | `timestamp` | available | available |
 | `attackType` | available | available |
+| `route` | available | available |
 | `method` | available | `null` |
-| `route` | available | `null` |
 | `responseTime` | available | `null` |
 | `statusCode` | available | `null` |
 | `userAgent` | available | `null` |
@@ -373,6 +391,7 @@ Response:
 | `routes` (stats) | available | `[]` |
 
 > In local mode only block/unblock events are tracked (no per-request logging).
+> `route` reflects the path of the request that triggered the block.
 > The Chrome Extension renders `null` fields as `—`.
 
 ---

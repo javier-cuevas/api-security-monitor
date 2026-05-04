@@ -28,7 +28,7 @@ export interface APIMonitorOptions {
   cleanupInterval?: number;
   /**
    * Local-mode only. Absolute path to an NDJSON file used for lightweight block persistence.
-   * Each line is a JSON object with fields: timestamp, ip, action, reason, expiresAt.
+   * Each line is a JSON object with fields: timestamp, ip, action, reason, route, expiresAt.
    *
    * On startup, non-expired blocks are restored from the file so bans survive restarts.
    * Compatible with jq, grep, tail -f, fail2ban, Filebeat, Logstash, and most SIEM tools.
@@ -69,6 +69,82 @@ export interface LocalBlockRecord {
   expiresAt: number;
   /** Attack type that caused the block */
   reason: string;
+  /** Request path that triggered the block. null if not available. */
+  route: string | null;
+}
+
+/**
+ * Common log entry shape returned by getLogs and getAttackLogs.
+ * In local mode (saveRecords: false), only ip, timestamp, attackType and route
+ * are populated — the rest are null.
+ * In advanced mode (saveRecords: true) all fields come from MongoDB.
+ */
+export interface LogEntry {
+  ip: string;
+  /** HTTP method. null in local mode. */
+  method: string | null;
+  /** Request path. Available in both modes. */
+  route: string | null;
+  timestamp: string | Date;
+  /** Response time in ms. null in local mode. */
+  responseTime: number | null;
+  /** HTTP status code. null in local mode. */
+  statusCode: number | null;
+  /** User-Agent header. null in local mode. */
+  userAgent: string | null;
+  /** Attack category that triggered the block, or null for normal requests. */
+  attackType: string | null;
+}
+
+/** Query options accepted by getLogs. All fields are optional. */
+export interface LogQuery {
+  /** Filter by exact IP address. */
+  ip?: string;
+  /** Filter by attack type, e.g. "DDoS (Excessive Requests)" or "Path Scanning". */
+  attackType?: string;
+  /** ISO-8601 or parseable date string. Returns entries on or after this date. */
+  startDate?: string;
+  /** ISO-8601 or parseable date string. Returns entries on or before this date. */
+  endDate?: string;
+  /** Maximum number of entries to return. Default: 10. */
+  limit?: number;
+}
+
+/**
+ * Per-IP statistics entry returned by getStats.
+ * In local mode totalRequests and avgResponseTime are null (requests are not individually logged).
+ */
+export interface StatEntry {
+  /** IP address */
+  _id: string;
+  /** Total requests from this IP. null in local mode. */
+  totalRequests: number | null;
+  /** Average response time in ms. null in local mode. */
+  avgResponseTime: number | null;
+  /** Number of attack events detected for this IP. */
+  attackCount: number;
+  /** Unique routes accessed. Empty array in local mode. */
+  routes: string[];
+}
+
+/** Single entry in the blocked list returned by getBlockedIPs. */
+export interface BlockedIPEntry {
+  ip: string;
+  /** Attack type that caused the block. */
+  reason: string;
+  /** Request path that triggered the block. null if not recorded. */
+  route: string | null;
+  /** Seconds remaining until the block expires. */
+  remainingSec: number;
+  /** ISO-8601 timestamp when the block expires. */
+  blockedUntil: string;
+}
+
+/** Result shape returned by getBlockedIPs. */
+export interface BlockedIPsResult {
+  /** Total number of currently blocked IPs. */
+  count: number;
+  blocked: BlockedIPEntry[];
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +210,55 @@ export declare class APIMonitorInstance extends EventEmitter {
 
   /** Express-compatible middleware that monitors and tracks the request. */
   monitorMiddleware(req: Request, res: Response, next: NextFunction): Promise<void>;
+
+  // ---------------------------------------------------------------------------
+  // Query methods — work in both local and advanced (Redis + MongoDB) modes
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Returns filtered log entries, most recent first.
+   *
+   * - Advanced mode: queries MongoDB.
+   * - Local mode: reads the NDJSON block log.
+   *
+   * @example
+   * const logs = await monitor.getLogs({ ip: '1.2.3.4', limit: 20 });
+   */
+  getLogs(opts?: LogQuery): Promise<LogEntry[]>;
+
+  /**
+   * Returns attack-only log entries (attackType != null), most recent first.
+   *
+   * - Advanced mode: queries MongoDB filtered by attackType.
+   * - Local mode: reads block entries from the NDJSON log.
+   *
+   * @example
+   * const attacks = await monitor.getAttackLogs({ limit: 50 });
+   */
+  getAttackLogs(opts?: { limit?: number }): Promise<LogEntry[]>;
+
+  /**
+   * Returns per-IP attack statistics sorted by attackCount descending.
+   *
+   * - Advanced mode: MongoDB aggregation (totalRequests and avgResponseTime populated).
+   * - Local mode: counts block events per IP from the NDJSON log (totalRequests and
+   *   avgResponseTime are null).
+   *
+   * @example
+   * const stats = await monitor.getStats();
+   */
+  getStats(): Promise<StatEntry[]>;
+
+  /**
+   * Returns all currently blocked IPs with their remaining TTL.
+   *
+   * - Advanced mode: scans Redis for blocked:* keys.
+   * - Local mode: reads localBlockedIPs, filtering out expired entries.
+   *
+   * @example
+   * const { count, blocked } = await monitor.getBlockedIPs();
+   */
+  getBlockedIPs(): Promise<BlockedIPsResult>;
 }
 
 // ---------------------------------------------------------------------------

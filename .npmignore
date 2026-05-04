@@ -31,3 +31,6 @@ CONTRIBUTING.md
 
 # Build
 /dist/
+
+# Coverage
+coverage/

@@ -482,12 +482,13 @@ describe('NDJSON Block Log Persistence', () => {
     const expiresAt = Date.now() + 300_000;
     fs.writeFileSync(
       logPath,
-      JSON.stringify({ action: 'block', ip: '70.70.70.70', reason: 'DDoS (Excessive Requests)', expiresAt }) + '\n'
+      JSON.stringify({ action: 'block', ip: '70.70.70.70', reason: 'DDoS (Excessive Requests)', route: '/api/users', expiresAt }) + '\n'
     );
 
     const { monitor } = APIMonitor({ blockLogPath: logPath });
     expect(monitor.localBlockedIPs.has('70.70.70.70')).toBe(true);
     expect(monitor.localBlockedIPs.get('70.70.70.70').reason).toBe('DDoS (Excessive Requests)');
+    expect(monitor.localBlockedIPs.get('70.70.70.70').route).toBe('/api/users');
   });
 
   it('ignores blocks that are already expired in the log', () => {
@@ -532,6 +533,7 @@ describe('NDJSON Block Log Persistence', () => {
     expect(blockEntry).toBeDefined();
     expect(blockEntry.ip).toBe('73.73.73.73');
     expect(blockEntry.reason).toBe('DDoS (Excessive Requests)');
+    expect(blockEntry.route).toBe('/');
     expect(typeof blockEntry.expiresAt).toBe('number');
     expect(typeof blockEntry.timestamp).toBe('string');
   });
@@ -627,30 +629,11 @@ describe('Dashboard Endpoints — local mode', () => {
   const path = require('path');
   const fs   = require('fs');
 
-  // Mirrors the helpers in basic-usage.js exactly
-  function readLog(logPath) {
-    if (!fs.existsSync(logPath)) return [];
-    return fs.readFileSync(logPath, 'utf8')
-      .split('\n').filter(Boolean)
-      .flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } });
-  }
-
-  function toLogShape(entry) {
-    return {
-      ip:           entry.ip,
-      method:       null,
-      route:        null,
-      timestamp:    entry.timestamp,
-      responseTime: null,
-      statusCode:   null,
-      userAgent:    null,
-      attackType:   entry.action === 'block' ? entry.reason : null,
-    };
-  }
-
-  // Builds a complete Express app with all dashboard endpoints mounted
+  // Builds a complete Express app with all dashboard endpoints mounted.
+  // Uses the APIMonitor query methods (getLogs, getAttackLogs, getStats, getBlockedIPs)
+  // so the tests exercise the same code path as the production examples.
   function buildDashboardApp(logPath, monitorOptions = {}) {
-    const result  = APIMonitor({ maxRequests: 1, blockLogPath: logPath, ...monitorOptions });
+    const result  = APIMonitor({ maxRequests: 2, blockLogPath: logPath, ...monitorOptions });
     const { middleware, blockIPs, monitor } = result;
 
     const app = express();
@@ -658,63 +641,33 @@ describe('Dashboard Endpoints — local mode', () => {
     app.use(blockIPs);
     app.use(middleware);
 
-    app.get('/logs', (req, res) => {
+    app.get('/logs', async (req, res) => {
       try {
         const { ip, attackType, startDate, endDate } = req.query;
         const limit = Math.min(parseInt(req.query.limit) || 10, 100);
-        let entries = readLog(logPath).filter(e => e.action === 'block');
-        if (typeof ip === 'string')
-          entries = entries.filter(e => e.ip === ip);
-        if (typeof attackType === 'string')
-          entries = entries.filter(e => e.reason === attackType);
-        if (startDate) {
-          const d = new Date(startDate);
-          if (isNaN(d.getTime())) return res.status(400).json({ error: 'Invalid startDate' });
-          entries = entries.filter(e => new Date(e.timestamp) >= d);
-        }
-        if (endDate) {
-          const d = new Date(endDate);
-          if (isNaN(d.getTime())) return res.status(400).json({ error: 'Invalid endDate' });
-          entries = entries.filter(e => new Date(e.timestamp) <= d);
-        }
-        res.json(entries.reverse().slice(0, limit).map(toLogShape));
+        if (startDate && isNaN(new Date(startDate).getTime())) return res.status(400).json({ error: 'Invalid startDate' });
+        if (endDate   && isNaN(new Date(endDate).getTime()))   return res.status(400).json({ error: 'Invalid endDate' });
+        res.json(await monitor.getLogs({ ip, attackType, startDate, endDate, limit }));
       } catch { res.status(500).json({ error: 'Error fetching logs' }); }
     });
 
-    app.get('/logs/attacks', (req, res) => {
+    app.get('/logs/attacks', async (req, res) => {
       try {
         const limit = Math.min(parseInt(req.query.limit) || 50, 100);
-        res.json(
-          readLog(logPath).filter(e => e.action === 'block').reverse().slice(0, limit).map(toLogShape)
-        );
+        res.json(await monitor.getAttackLogs({ limit }));
       } catch { res.status(500).json({ error: 'Error fetching attack logs' }); }
     });
 
-    app.get('/logs/stats', (req, res) => {
+    app.get('/logs/stats', async (req, res) => {
       try {
-        const byIP = {};
-        for (const e of readLog(logPath).filter(e => e.action === 'block')) {
-          if (!byIP[e.ip]) byIP[e.ip] = { _id: e.ip, totalRequests: null, avgResponseTime: null, attackCount: 0, routes: [] };
-          byIP[e.ip].attackCount++;
-        }
-        res.json(Object.values(byIP).sort((a, b) => b.attackCount - a.attackCount));
+        res.json(await monitor.getStats());
       } catch { res.status(500).json({ error: 'Error fetching stats' }); }
     });
 
-    app.get('/blocked', (req, res) => {
-      const now = Date.now();
-      const blocked = [];
-      for (const [ip, info] of monitor.localBlockedIPs) {
-        if (info.expiresAt > now) {
-          blocked.push({
-            ip,
-            reason:       info.reason,
-            remainingSec: Math.ceil((info.expiresAt - now) / 1000),
-            blockedUntil: new Date(info.expiresAt).toISOString(),
-          });
-        }
-      }
-      res.json({ count: blocked.length, blocked });
+    app.get('/blocked', async (req, res) => {
+      try {
+        res.json(await monitor.getBlockedIPs());
+      } catch { res.status(500).json({ error: 'Error fetching blocked IPs' }); }
     });
 
     app.get('*', (_req, res) => res.sendStatus(200));
@@ -729,9 +682,13 @@ describe('Dashboard Endpoints — local mode', () => {
     monitor = m;
     agent   = request(app);
 
-    // Trigger blocks from two different IPs (maxRequests:1 → 2 requests = block)
+    // Trigger blocks from two different IPs (maxRequests:2 → 3 requests = block).
+    // Using 3 requests keeps the test runner's own dashboard requests (≤2 per test)
+    // below maxRequests so loopback is never blocked unexpectedly.
+    await agent.get('/').set('x-forwarded-for', '100.0.0.1');
     await agent.get('/').set('x-forwarded-for', '100.0.0.1');
     await agent.get('/').set('x-forwarded-for', '100.0.0.1'); // block 100.0.0.1
+    await agent.get('/').set('x-forwarded-for', '100.0.0.2');
     await agent.get('/').set('x-forwarded-for', '100.0.0.2');
     await agent.get('/').set('x-forwarded-for', '100.0.0.2'); // block 100.0.0.2
 
@@ -756,17 +713,17 @@ describe('Dashboard Endpoints — local mode', () => {
     expect(entry).toHaveProperty('attackType');
     expect(entry).toHaveProperty('timestamp');
     expect(entry).toHaveProperty('method');       // null in local mode
-    expect(entry).toHaveProperty('route');        // null in local mode
+    expect(entry).toHaveProperty('route');        // available in local mode
     expect(entry).toHaveProperty('responseTime'); // null in local mode
     expect(entry).toHaveProperty('statusCode');   // null in local mode
     expect(entry).toHaveProperty('userAgent');    // null in local mode
   });
 
-  it('GET /logs local-mode fields are null', async () => {
+  it('GET /logs local-mode null fields (route is populated)', async () => {
     const res = await agent.get('/logs');
     const entry = res.body[0];
     expect(entry.method).toBeNull();
-    expect(entry.route).toBeNull();
+    expect(entry.route).toBe('/');               // stored from the triggering request path
     expect(entry.responseTime).toBeNull();
     expect(entry.statusCode).toBeNull();
     expect(entry.userAgent).toBeNull();
@@ -880,6 +837,7 @@ describe('Dashboard Endpoints — local mode', () => {
     const entry = res.body.blocked[0];
     expect(entry).toHaveProperty('ip');
     expect(entry).toHaveProperty('reason');
+    expect(entry).toHaveProperty('route');
     expect(entry).toHaveProperty('remainingSec');
     expect(entry).toHaveProperty('blockedUntil');
   });
